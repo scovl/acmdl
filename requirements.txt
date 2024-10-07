@@ -1,0 +1,4 @@
+requests==2.31.0
+selenium==4.10.0
+toml==0.10.2
+webdriver-manager==3.8.6
