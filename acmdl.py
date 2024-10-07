@@ -60,7 +60,7 @@ try:
                 print(f"PDF link not found at: {article_url}")
 
             # Pause to avoid too many requests in a short time
-            time.sleep(1)
+            time.sleep(15)
 
         except requests.RequestException as e:
             print(f"Error processing article {article_url}: {e}")
