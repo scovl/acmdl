@@ -1,5 +1,11 @@
 import requests
-from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from webdriver_manager.chrome import ChromeDriverManager
 import re
 import os
 import time
@@ -9,43 +15,52 @@ query = "Java nullpointer"
 url_base = "https://dl.acm.org"
 search_url = f"{url_base}/action/doSearch?AllField={query.replace(' ', '+')}"
 
-# Headers to avoid being blocked (imitating a common browser)
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
-}
-
 # Directory to save PDFs
 os.makedirs("acm_pdfs", exist_ok=True)
 
+# Setting up Selenium WebDriver
+options = webdriver.ChromeOptions()
+options.add_argument('--headless')
+options.add_argument('--no-sandbox')
+options.add_argument('--disable-dev-shm-usage')
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
 try:
     # Making the search request on ACM
-    response = requests.get(search_url, headers=HEADERS)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.content, "html.parser")
+    driver.get(search_url)
+    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-    # Getting the article links
-    articles = soup.find_all("a", href=re.compile("^/doi/"))
-    article_links = [url_base + article["href"] for article in articles]
+    # Check if the IP address has been blocked
+    if "Your IP Address has been blocked" in driver.page_source:
+        print("Your IP Address has been blocked. Please try using a VPN or wait for a while before trying again.")
+    else:
+        # Getting the article links
+        articles = driver.find_elements(By.XPATH, "//a[contains(@href, '/doi/')]")
+        article_links = [article.get_attribute("href") for article in articles]
 
-    # Downloading PDFs
-    for article_url in article_links:
-        try:
-            article_response = requests.get(article_url, headers=HEADERS)
-            article_response.raise_for_status()
-            article_soup = BeautifulSoup(article_response.content, "html.parser")
+        if not article_links:
+            print("No articles found. Please check the query or the website structure.")
 
-            # Finding the PDF link
-            pdf_link = article_soup.find("a", href=re.compile("/doi/pdf/"))
-            if pdf_link:
-                pdf_url = url_base + pdf_link["href"]
-                pdf_response = requests.get(pdf_url, headers=HEADERS)
+        # Downloading PDFs
+        for article_url in article_links:
+            try:
+                driver.get(article_url)
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-                # Ignore PDFs that return 403 error or others
-                if pdf_response.status_code == 200:
-                    # Extracting the article title to use as file name
-                    title_tag = article_soup.find("h1", class_="citation__title")
-                    if title_tag:
-                        title = title_tag.get_text(strip=True).replace('/', '-')
+                # Finding the PDF link
+                try:
+                    pdf_link = driver.find_element(By.XPATH, "//a[contains(@href, '/doi/pdf/')]")
+                    pdf_url = pdf_link.get_attribute("href")
+                    pdf_response = requests.get(pdf_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'})
+
+                    # Ignore PDFs that return 403 error or others
+                    if pdf_response.status_code == 200:
+                        # Extracting the article title to use as file name
+                        try:
+                            title_tag = driver.find_element(By.CLASS_NAME, "citation__title")
+                            title = title_tag.text.strip().replace('/', '-')
+                        except:
+                            title = "unknown_title"
                         file_path = os.path.join("acm_pdfs", f"{title}.pdf")
 
                         # Saving the PDF
@@ -53,24 +68,23 @@ try:
                             pdf_file.write(pdf_response.content)
                         print(f"Downloaded: {title}")
                     else:
-                        print(f"Title not found for article at: {article_url}")
-                else:
-                    print(f"Access denied to PDF at: {pdf_url}")
-            else:
-                print(f"PDF link not found at: {article_url}")
+                        print(f"Access denied to PDF at: {pdf_url}")
+                except TimeoutException:
+                    print(f"PDF link not found at: {article_url}")
 
-            # Pause to avoid too many requests in a short time
-            time.sleep(15)
+                # Pause to avoid too many requests in a short time
+                time.sleep(10)
 
-        except requests.RequestException as e:
-            print(f"Error processing article {article_url}: {e}")
-            continue
+            except (requests.RequestException, TimeoutException) as e:
+                print(f"Error processing article {article_url}: {e}")
+                continue
 
-except requests.RequestException as e:
+except TimeoutException as e:
     print(f"Error accessing search page: {e}")
-    if response.status_code == 403:
-        print("Access denied to the search page. Check if you have proper access or try again later.")
+
+finally:
+    driver.quit()
 
 # Usage instructions
 if __name__ == "__main__":
-    print("Usage: python acmdl.py")
+    print("Script executed. Check the console output for details on downloaded articles.")
