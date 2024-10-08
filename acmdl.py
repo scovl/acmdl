@@ -8,8 +8,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from PyPDF2 import PdfReader
+import io
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,11 +36,25 @@ options.add_argument('--no-sandbox')
 options.add_argument('--disable-dev-shm-usage')
 driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
+# Setting up requests session with retries
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+session.mount('https://', HTTPAdapter(max_retries=retries))
+
+def is_valid_pdf(content):
+    try:
+        pdf_reader = PdfReader(io.BytesIO(content))
+        if len(pdf_reader.pages) > 0:
+            return True
+    except Exception as e:
+        logging.warning("Invalid PDF file: %s", e)
+    return False
+
 try:
     # Making the search request on ACM
     logging.info("Accessing search page...")
     driver.get(search_url)
-    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
     # Check if the IP address has been blocked
     if "Your IP Address has been blocked" in driver.page_source:
@@ -54,39 +72,59 @@ try:
             try:
                 logging.info("Processing article: %s", article_url)
                 driver.get(article_url)
-                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-                # Finding the PDF link
+                # Adding an explicit wait for the PDF link to appear
                 try:
-                    pdf_link = driver.find_element(By.XPATH, "//a[contains(@href, '/doi/pdf/')]")
-                    pdf_url = pdf_link.get_attribute("href")
-                    pdf_response = requests.get(pdf_url, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
-                    })
+                    # Locate the PDF download link based on the title attribute
+                    pdf_link = None
+                    try:
+                        pdf_link = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//a[@title='View PDF']")))
+                    except TimeoutException:
+                        # If the 'View PDF' link is not found, try to find 'View online with eReader'
+                        e_reader_link = driver.find_element(By.XPATH, "//a[@aria-label='View online with eReader']")
+                        if e_reader_link:
+                            pdf_link = e_reader_link
 
-                    # Ignore PDFs that return 403 error or others
-                    if pdf_response.status_code == 200:
+                    if pdf_link:
+                        pdf_url = pdf_link.get_attribute("href")
+
+                        # Checking if the PDF URL is accessible
+                        response = session.head(pdf_url, allow_redirects=True, timeout=10)
+                        if response.status_code != 200:
+                            logging.warning("PDF is not accessible (status code: %d), skipping: %s", response.status_code, pdf_url)
+                            continue
+
                         # Extracting the article title to use as file name
                         try:
-                            title_tag = driver.find_element(By.CLASS_NAME, "citation__title")
-                            title = title_tag.text.strip().replace('/', '-')
-                        except NoSuchElementException:
-                            title = "unknown_title"
+                            title_tag = driver.find_element(By.TAG_NAME, "h1")
+                            title = title_tag.text.strip().replace('/', '-').replace('\\', '-').replace('"', '').replace("'", '')
+                            if not title:
+                                raise ValueError("Empty title extracted")
+                        except (NoSuchElementException, ValueError):
+                            title = f"article_{int(time.time())}"
                         file_path = os.path.join("acm_pdfs", f"{title}.pdf")
 
-                        # Saving the PDF
-                        with open(file_path, "wb") as pdf_file:
-                            pdf_file.write(pdf_response.content)
-                        logging.info("Downloaded: %s", title)
-                    else:
-                        logging.warning("Access denied to PDF at: %s", pdf_url)
-                except (TimeoutException, NoSuchElementException):
+                        # Downloading the PDF content using requests
+                        pdf_response = session.get(pdf_url, stream=True)
+                        if pdf_response.status_code == 200:
+                            pdf_content = pdf_response.content
+                            if is_valid_pdf(pdf_content):
+                                with open(file_path, "wb") as pdf_file:
+                                    pdf_file.write(pdf_content)
+                                logging.info("Downloaded: %s", title)
+                            else:
+                                logging.warning("The PDF is not valid, skipping: %s", pdf_url)
+                        else:
+                            logging.warning("Failed to download PDF, status code: %d, URL: %s", pdf_response.status_code, pdf_url)
+
+                except (TimeoutException, NoSuchElementException, StaleElementReferenceException):
                     logging.warning("PDF link not found at: %s", article_url)
 
                 # Pause to avoid too many requests in a short time
-                time.sleep(10)
+                time.sleep(5)
 
-            except (requests.RequestException, TimeoutException) as e:
+            except (requests.RequestException, TimeoutException, WebDriverException) as e:
                 logging.error("Error processing article %s: %s", article_url, e)
                 continue
 
